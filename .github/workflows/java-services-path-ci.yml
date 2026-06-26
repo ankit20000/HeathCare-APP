@@ -4,21 +4,21 @@ on:
   push:
     branches:
       - main
-      #- master
+      - master
     paths:
-      - "appointment-service/**"
-      - "doctor-service/**"
-      - "patient-service/**"
-      - "report-service/**"
-      - "user-service/**"
+      - "healthcare-microservices/appointment-service/**"
+      - "healthcare-microservices/doctor-service/**"
+      - "healthcare-microservices/patient-service/**"
+      - "healthcare-microservices/report-service/**"
+      - "healthcare-microservices/user-service/**"
       - ".github/workflows/java-services-path-ci.yml"
   pull_request:
     paths:
-      - "appointment-service/**"
-      - "doctor-service/**"
-      - "patient-service/**"
-      - "report-service/**"
-      - "user-service/**"
+      - "healthcare-microservices/appointment-service/**"
+      - "healthcare-microservices/doctor-service/**"
+      - "healthcare-microservices/patient-service/**"
+      - "healthcare-microservices/report-service/**"
+      - "healthcare-microservices/user-service/**"
       - ".github/workflows/java-services-path-ci.yml"
   workflow_dispatch:
 
@@ -51,19 +51,19 @@ jobs:
         with:
           filters: |
             appointment-service:
-              - "appointment-service/**"
+              - "healthcare-microservices/appointment-service/**"
               - ".github/workflows/java-services-path-ci.yml"
             doctor-service:
-              - "doctor-service/**"
+              - "healthcare-microservices/doctor-service/**"
               - ".github/workflows/java-services-path-ci.yml"
             patient-service:
-              - "patient-service/**"
+              - "healthcare-microservices/patient-service/**"
               - ".github/workflows/java-services-path-ci.yml"
             report-service:
-              - "report-service/**"
+              - "healthcare-microservices/report-service/**"
               - ".github/workflows/java-services-path-ci.yml"
             user-service:
-              - "user-service/**"
+              - "healthcare-microservices/user-service/**"
               - ".github/workflows/java-services-path-ci.yml"
 
       - name: Build service matrix
@@ -93,7 +93,7 @@ jobs:
         service: ${{ fromJSON(needs.detect-changes.outputs.services) }}
     defaults:
       run:
-        working-directory: ${{ matrix.service }}
+        working-directory: healthcare-microservices/${{ matrix.service }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -127,7 +127,7 @@ jobs:
         service: ${{ fromJSON(needs.detect-changes.outputs.services) }}
     defaults:
       run:
-        working-directory: ${{ matrix.service }}
+        working-directory: healthcare-microservices/${{ matrix.service }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -181,6 +181,6 @@ jobs:
         timeout-minutes: 15
         uses: docker/build-push-action@v6
         with:
-          context: ./${{ matrix.service }}
+          context: ./healthcare-microservices/${{ matrix.service }}
           push: false
           tags: healthcare/${{ matrix.service }}:ci

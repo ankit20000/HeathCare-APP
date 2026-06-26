@@ -31,7 +31,7 @@ jobs:
           - user-service
     defaults:
       run:
-        working-directory: ${{ matrix.service }}
+        working-directory: healthcare-microservices/${{ matrix.service }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -67,7 +67,7 @@ jobs:
           - user-service
     defaults:
       run:
-        working-directory: ${{ matrix.service }}
+        working-directory: healthcare-microservices/${{ matrix.service }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -123,6 +123,6 @@ jobs:
         timeout-minutes: 15
         uses: docker/build-push-action@v6
         with:
-          context: ./${{ matrix.service }}
+          context: ./healthcare-microservices/${{ matrix.service }}
           push: false
           tags: healthcare/${{ matrix.service }}:ci
