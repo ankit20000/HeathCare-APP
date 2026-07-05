@@ -1,0 +1,527 @@
+# Production-Grade Continuous Integration (CI) Pipeline for Java Microservices
+# Designed by Principal DevOps Architect
+# Repository: https://github.com/Subinoy2024/HeathCare-APP
+
+pipeline:
+  name: healthcare-ci-pipeline
+  identifier: healthcarecipipeline
+  projectIdentifier: default
+  orgIdentifier: default
+  tags:
+    environment: production
+    compliance: hipaa
+    tech-stack: java-maven-spring-boot
+
+  # =========================================================================
+  # PIPELINE PROPERTIES & CODEBASE RELATION
+  # =========================================================================
+  properties:
+    ci:
+      codebase:
+        connectorRef: account.github_connector # Enterprise GitHub Connector
+        build: <+input> # Dynamic runtime input (e.g. PR, push branch)
+
+  # =========================================================================
+  # PIPELINE VARIABLES
+  # =========================================================================
+  variables:
+    - name: APP_NAME
+      type: String
+      value: healthcare-app
+      description: "Name of the target microservice application"
+    - name: JAVA_VERSION
+      type: String
+      value: "17"
+      description: "Target JDK version for compilation and runtime"
+    - name: MAVEN_VERSION
+      type: String
+      value: "3.9.8"
+      description: "Maven version used for building"
+    - name: SERVICE_PATH
+      type: String
+      value: "healthcare-microservices/appointment-service"
+      description: "Path to the target microservice in the mono-repo"
+    - name: IMAGE_NAME
+      type: String
+      value: healthcare-app
+      description: "Target Docker image name"
+    - name: IMAGE_TAG
+      type: String
+      value: "<+pipeline.sequenceId>"
+      description: "Target tag (defaults to build number)"
+    - name: DOCKER_REGISTRY
+      type: String
+      value: myacr.azurecr.io # Enterprise Azure Container Registry domain
+      description: "ACR fully qualified domain name"
+    - name: SONAR_PROJECT_KEY
+      type: String
+      value: Subinoy2024_HeathCare-APP
+      description: "SonarCloud Project Key"
+    - name: SONAR_ORGANIZATION
+      type: String
+      value: subinoy2024
+      description: "SonarCloud Organization ID"
+    - name: SONAR_HOST_URL
+      type: String
+      value: https://sonarcloud.io
+      description: "SonarCloud URL"
+    - name: TRIVY_SEVERITY
+      type: String
+      value: HIGH,CRITICAL
+      description: "Vulnerability severities to trigger container scan failure"
+
+  # =========================================================================
+  # BUILD STAGES DEFINITION
+  # =========================================================================
+  stages:
+    - stage:
+        name: Build Test and Push
+        identifier: build_test_and_push
+        type: CI
+        spec:
+          cloneCodebase: true # Stage 1: Checkout codebase natively
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: account.k8s_delegate_connector # Direct K8s Delegate execution
+              namespace: harness-delegate-ng
+              nodeSelector:
+                agent: build-runner
+              os: Linux
+          
+          # Shared paths allow preserving work directories and caches across steps in the same stage pod
+          sharedPaths:
+            - /root/.m2 # Maven local cache directory
+            - /workspace/reports # Centralized reporting repository
+
+          # Background sidecar for Docker-in-Docker to run secure isolated Docker operations
+          services:
+            - identifier: dind
+              name: Docker Daemon
+              spec:
+                connectorRef: account.github_connector
+                image: docker:24.0.7-dind
+                privileged: true
+
+          execution:
+            steps:
+              # ---------------------------------------------------------------
+              # STAGE 1: SOURCE CODE CHECKOUT (METADATA PRINTING)
+              # ---------------------------------------------------------------
+              - step:
+                  type: Run
+                  name: Display Build Metadata
+                  identifier: Display_Build_Metadata
+                  description: "Purpose: Display build triggers and Git metadata for compliance and traceability."
+                  spec:
+                    image: alpine:latest
+                    shell: Sh
+                    command: |-
+                      echo "====================================================="
+                      echo "STAGE 1: BUILD METADATA"
+                      echo "====================================================="
+                      echo "Application Name : <+pipeline.variables.APP_NAME>"
+                      echo "Source Code Path : <+pipeline.variables.SERVICE_PATH>"
+                      echo "Repository URL   : <+codebase.repoUrl>"
+                      echo "Target Branch    : <+codebase.branch>"
+                      echo "Git Commit SHA   : <+codebase.commitSha>"
+                      echo "Commit Message   : <+codebase.commitMessage>"
+                      echo "Triggered By     : <+codebase.commitAuthor>"
+                      echo "Harness Build ID : <+pipeline.sequenceId>"
+                      echo "Execution Host   : K8s Runner"
+                      echo "====================================================="
+
+              # ---------------------------------------------------------------
+              # STAGE 2: DEPENDENCY RESTORE
+              # ---------------------------------------------------------------
+              - step:
+                  type: RestoreCache
+                  name: Restore Maven Cache
+                  identifier: Restore_Maven_Cache
+                  description: "Purpose: Restores Maven local repository cache from storage to accelerate builds."
+                  spec:
+                    connectorRef: account.gcs_or_s3_connector # Storage connector for caches
+                    key: maven-cache-{{ checksum "healthcare-microservices/appointment-service/pom.xml" }}
+                    archiveFormat: Tar
+                    sourcePath: /root/.m2/repository
+                  failureBehavior:
+                    - type: Ignore # Do not fail the pipeline if cache restore fails (falls back to fresh pull)
+
+              # ---------------------------------------------------------------
+              # STAGE 3: BUILD (COMPILE)
+              # ---------------------------------------------------------------
+              - step:
+                  type: Run
+                  name: Maven Compile
+                  identifier: Maven_Compile
+                  description: "Purpose: Verify syntactic and semantic correctness by compiling Java classes."
+                  spec:
+                    image: maven:3.9.8-eclipse-temurin-17
+                    shell: Sh
+                    command: |-
+                      cd <+pipeline.variables.SERVICE_PATH>
+                      mvn clean compile -B -ntp
+                  timeout: 10m
+
+              # ---------------------------------------------------------------
+              # STAGE 4: UNIT TESTING
+              # ---------------------------------------------------------------
+              - step:
+                  type: Run
+                  name: Maven Unit Tests
+                  identifier: Maven_Unit_Tests
+                  description: "Purpose: Run unit testing suite, publish JUnit reports, and fail on regressions."
+                  spec:
+                    image: maven:3.9.8-eclipse-temurin-17
+                    shell: Sh
+                    command: |-
+                      cd <+pipeline.variables.SERVICE_PATH>
+                      # Run tests; create reports dir
+                      mkdir -p /workspace/reports/junit
+                      mvn test -B -ntp
+                    reports:
+                      type: JUnit
+                      spec:
+                        paths:
+                          - "<+pipeline.variables.SERVICE_PATH>/target/surefire-reports/*.xml"
+                  timeout: 15m
+                  failureBehavior:
+                    - type: Fail # Critical: Fail pipeline immediately if any unit test fails
+
+              # ---------------------------------------------------------------
+              # STAGE 5: PACKAGE APPLICATION
+              # ---------------------------------------------------------------
+              - step:
+                  type: Run
+                  name: Maven Package Artifact
+                  identifier: Maven_Package_Artifact
+                  description: "Purpose: Bundle compiled code and configurations into a deployable Spring Boot JAR file."
+                  spec:
+                    image: maven:3.9.8-eclipse-temurin-17
+                    shell: Sh
+                    command: |-
+                      cd <+pipeline.variables.SERVICE_PATH>
+                      mvn package -DskipTests -B -ntp
+                      mkdir -p /workspace/artifacts
+                      cp target/*.jar /workspace/artifacts/app.jar
+                  timeout: 10m
+
+              # ---------------------------------------------------------------
+              # STAGE 6: SONARCLOUD ANALYSIS
+              # ---------------------------------------------------------------
+              - step:
+                  type: Run
+                  name: SonarCloud Quality Gate Scan
+                  identifier: SonarCloud_Quality_Gate_Scan
+                  description: "Purpose: Perform static code analysis for code quality, bugs, test coverage, and security hotspots."
+                  spec:
+                    image: maven:3.9.8-eclipse-temurin-17
+                    shell: Sh
+                    command: |-
+                      cd <+pipeline.variables.SERVICE_PATH>
+                      # Execute Sonar analysis and wait for Quality Gate check
+                      mvn verify sonar:sonar \
+                        -Dsonar.host.url=<+pipeline.variables.SONAR_HOST_URL> \
+                        -Dsonar.projectKey=<+pipeline.variables.SONAR_PROJECT_KEY> \
+                        -Dsonar.organization=<+pipeline.variables.SONAR_ORGANIZATION> \
+                        -Dsonar.token=<+secrets.getValue("sonar_token")> \
+                        -Dsonar.qualitygate.wait=true \
+                        -DskipTests -B -ntp
+                  timeout: 20m
+
+              # ---------------------------------------------------------------
+              # STAGE 7: SECRET SCANNING
+              # ---------------------------------------------------------------
+              - step:
+                  type: Run
+                  name: GitLeaks Secret Scan
+                  identifier: GitLeaks_Secret_Scan
+                  description: "Purpose: Audit commit history and workspace for exposed credentials, keys, or API tokens."
+                  spec:
+                    image: zricethezav/gitleaks:latest
+                    shell: Sh
+                    command: |-
+                      mkdir -p /workspace/reports/gitleaks
+                      gitleaks detect --source=. --verbose --redact --report-format=json --report-path=/workspace/reports/gitleaks/gitleaks-report.json
+                  timeout: 5m
+
+              # ---------------------------------------------------------------
+              # STAGE 8: DEPENDENCY VULNERABILITY SCAN (OWASP)
+              # ---------------------------------------------------------------
+              - step:
+                  type: Run
+                  name: OWASP Dependency Vulnerability Scan
+                  identifier: OWASP_Dependency_Scan
+                  description: "Purpose: Audit transitively imported dependencies for published CVE vulnerability databases."
+                  spec:
+                    image: owasp/dependency-check:latest
+                    shell: Sh
+                    command: |-
+                      mkdir -p /workspace/reports/dependency-check
+                      /usr/share/dependency-check/bin/dependency-check.sh \
+                        --project "<+pipeline.variables.APP_NAME>" \
+                        --scan "<+pipeline.variables.SERVICE_PATH>" \
+                        --format HTML --format XML \
+                        --out /workspace/reports/dependency-check \
+                        --failOnCVSS 9.0 # Fail pipeline if Critical (>=9.0 CVSS) vulnerability is detected
+                  timeout: 20m
+
+              # ---------------------------------------------------------------
+              # STAGE 9: BUILD DOCKER IMAGE
+              # ---------------------------------------------------------------
+              - step:
+                  type: Run
+                  name: Build Local Container Image
+                  identifier: Build_Local_Container_Image
+                  description: "Purpose: Compile container image locally from Dockerfile to prepare for security scanning."
+                  spec:
+                    image: docker:24.0.7
+                    shell: Sh
+                    envVariables:
+                      DOCKER_HOST: tcp://localhost:2375
+                    command: |-
+                      cd <+pipeline.variables.SERVICE_PATH>
+                      
+                      # Build Docker image using the Docker-in-Docker background service daemon
+                      docker build -t local/<+pipeline.variables.IMAGE_NAME>:latest \
+                        -t local/<+pipeline.variables.IMAGE_NAME>:<+codebase.commitSha> \
+                        -t local/<+pipeline.variables.IMAGE_NAME>:<+pipeline.sequenceId> .
+                  timeout: 15m
+
+              # ---------------------------------------------------------------
+              # STAGE 10: CONTAINER IMAGE SCAN (TRIVY)
+              # ---------------------------------------------------------------
+              - step:
+                  type: Run
+                  name: Trivy Container Image Scan
+                  identifier: Trivy_Container_Scan
+                  description: "Purpose: Scan local container image filesystem layers for system and package level vulnerabilities before registry upload."
+                  spec:
+                    image: aquasec/trivy:latest
+                    shell: Sh
+                    envVariables:
+                      DOCKER_HOST: tcp://localhost:2375
+                    command: |-
+                      mkdir -p /workspace/reports/trivy
+                      
+                      # Generate HTML report for DevOps Dashboards
+                      trivy image --severity <+pipeline.variables.TRIVY_SEVERITY> --format template --template "@contrib/html.tpl" -o /workspace/reports/trivy/trivy-report.html local/<+pipeline.variables.IMAGE_NAME>:latest
+                      
+                      # Generate SARIF report for security dashboards (e.g. GitHub Security tab)
+                      trivy image --severity <+pipeline.variables.TRIVY_SEVERITY> --format sarif -o /workspace/reports/trivy/trivy-report.sarif local/<+pipeline.variables.IMAGE_NAME>:latest
+                      
+                      # Enforce Quality Gate: fail command execution on detected HIGH,CRITICAL severities
+                      trivy image --severity <+pipeline.variables.TRIVY_SEVERITY> --exit-code 1 local/<+pipeline.variables.IMAGE_NAME>:latest
+                  timeout: 10m
+
+              # ---------------------------------------------------------------
+              # STAGE 11: PUSH IMAGE
+              # ---------------------------------------------------------------
+              - step:
+                  type: Run
+                  name: Push Image to ACR
+                  identifier: Push_Image_to_ACR
+                  description: "Purpose: Securely authenticate with Azure Container Registry and push verified image tags."
+                  spec:
+                    image: docker:24.0.7
+                    shell: Sh
+                    envVariables:
+                      DOCKER_HOST: tcp://localhost:2375
+                      ACR_PASSWORD: <+secrets.getValue("acr_password")>
+                    command: |-
+                      # Log in securely without credentials visibility in logs
+                      echo "$ACR_PASSWORD" | docker login <+pipeline.variables.DOCKER_REGISTRY> -u <+pipeline.variables.IMAGE_NAME> --password-stdin
+                      
+                      # Tag local images for remote ACR registry mapping
+                      docker tag local/<+pipeline.variables.IMAGE_NAME>:latest <+pipeline.variables.DOCKER_REGISTRY>/<+pipeline.variables.IMAGE_NAME>:latest
+                      docker tag local/<+pipeline.variables.IMAGE_NAME>:latest <+pipeline.variables.DOCKER_REGISTRY>/<+pipeline.variables.IMAGE_NAME>:<+codebase.commitSha>
+                      docker tag local/<+pipeline.variables.IMAGE_NAME>:latest <+pipeline.variables.DOCKER_REGISTRY>/<+pipeline.variables.IMAGE_NAME>:<+pipeline.sequenceId>
+                      
+                      # Push tags to ACR registry
+                      docker push <+pipeline.variables.DOCKER_REGISTRY>/<+pipeline.variables.IMAGE_NAME>:latest
+                      docker push <+pipeline.variables.DOCKER_REGISTRY>/<+pipeline.variables.IMAGE_NAME>:<+codebase.commitSha>
+                      docker push <+pipeline.variables.DOCKER_REGISTRY>/<+pipeline.variables.IMAGE_NAME>:<+pipeline.sequenceId>
+                  timeout: 15m
+
+              # ---------------------------------------------------------------
+              # STAGE 12: PUBLISH BUILD INFORMATION
+              # ---------------------------------------------------------------
+              - step:
+                  type: Run
+                  name: Publish Build Information
+                  identifier: Publish_Build_Information
+                  description: "Purpose: Output structured runtime build and container verification parameters."
+                  spec:
+                    image: docker:24.0.7
+                    shell: Sh
+                    envVariables:
+                      DOCKER_HOST: tcp://localhost:2375
+                    command: |-
+                      echo "====================================================="
+                      echo "CI PIPELINE EXECUTION SUMMARY"
+                      echo "====================================================="
+                      echo "Application Name: <+pipeline.variables.APP_NAME>"
+                      echo "Version          : <+pipeline.variables.IMAGE_TAG>"
+                      echo "Build Number     : <+pipeline.sequenceId>"
+                      echo "Git Commit SHA   : <+codebase.commitSha>"
+                      echo "Target Branch    : <+codebase.branch>"
+                      echo "Docker Registry  : <+pipeline.variables.DOCKER_REGISTRY>"
+                      echo "Docker Image     : <+pipeline.variables.DOCKER_REGISTRY>/<+pipeline.variables.IMAGE_NAME>"
+                      echo "Image Digest     : $(docker inspect --format='{{index .RepoDigests 0}}' local/<+pipeline.variables.IMAGE_NAME>:latest 2>/dev/null || echo 'N/A')"
+                      echo "Build Duration   : <+pipeline.duration> seconds"
+                      echo "====================================================="
+                  timeout: 5m
+
+              # ---------------------------------------------------------------
+              # STAGE 13: SAVE MAVEN CACHE
+              # ---------------------------------------------------------------
+              - step:
+                  type: SaveCache
+                  name: Save Maven Cache
+                  identifier: Save_Maven_Cache
+                  description: "Purpose: Store local Maven repository back to GCS/S3 to avoid redownloading dependencies in subsequent builds."
+                  spec:
+                    connectorRef: account.gcs_or_s3_connector
+                    key: maven-cache-{{ checksum "healthcare-microservices/appointment-service/pom.xml" }}
+                    archiveFormat: Tar
+                    sourcePath: /root/.m2/repository
+                  failureBehavior:
+                    - type: Ignore # Do not fail the pipeline if cache saving fails
+
+              # ---------------------------------------------------------------
+              # STAGE 13: NOTIFICATIONS (FAILURES ONLY WEBHOOKS)
+              # ---------------------------------------------------------------
+              - step:
+                  type: Run
+                  name: Send Failure Notification
+                  identifier: Send_Failure_Notification
+                  description: "Purpose: Alert team of pipeline or Quality Gate failures on Slack/Teams."
+                  when:
+                    stageStatus: Failure # Execute only if one or more prior steps in this stage failed
+                  spec:
+                    image: python:3.11-alpine
+                    shell: Python
+                    envVariables:
+                      SLACK_WEBHOOK: <+secrets.getValue("slack_webhook")>
+                      TEAMS_WEBHOOK: <+secrets.getValue("teams_webhook")>
+                    command: |-
+                      import os
+                      import urllib.request
+                      import json
+
+                      slack_webhook = os.environ.get("SLACK_WEBHOOK")
+                      teams_webhook = os.environ.get("TEAMS_WEBHOOK")
+
+                      build_id = "<+pipeline.sequenceId>"
+                      branch = "<+codebase.branch>"
+                      commit = "<+codebase.commitSha>"
+                      console_url = "<+pipeline.url>"
+
+                      if slack_webhook:
+                          slack_payload = {
+                              "text": f"❌ *Healthcare CI Pipeline Failure* \n*Build ID:* {build_id} \n*Branch:* {branch} \n*Commit:* {commit} \n*Console Link:* {console_url}"
+                          }
+                          try:
+                              req = urllib.request.Request(
+                                  slack_webhook,
+                                  data=json.dumps(slack_payload).encode('utf-8'),
+                                  headers={'Content-Type': 'application/json'}
+                              )
+                              urllib.request.urlopen(req)
+                          except Exception as e:
+                              print(f"Failed to send Slack notification: {e}")
+
+                      if teams_webhook:
+                          teams_payload = {
+                              "@type": "MessageCard",
+                              "@context": "http://schema.org/extensions",
+                              "themeColor": "d63031",
+                              "summary": "Harness CI Build Failure",
+                              "sections": [{
+                                  "activityTitle": "❌ Healthcare CI Build Failure",
+                                  "facts": [
+                                      {"name": "Build Number", "value": build_id},
+                                      {"name": "Branch", "value": branch},
+                                      {"name": "Commit", "value": commit}
+                                  ]
+                              }]
+                          }
+                          try:
+                              req = urllib.request.Request(
+                                  teams_webhook,
+                                  data=json.dumps(teams_payload).encode('utf-8'),
+                                  headers={'Content-Type': 'application/json'}
+                              )
+                              urllib.request.urlopen(req)
+                          except Exception as e:
+                              print(f"Failed to send Teams notification: {e}")
+
+              # ---------------------------------------------------------------
+              # STAGE 13: NOTIFICATIONS (SUCCESS ONLY WEBHOOKS)
+              # ---------------------------------------------------------------
+              - step:
+                  type: Run
+                  name: Send Success Notification
+                  identifier: Send_Success_Notification
+                  description: "Purpose: Notify development channel of successfully completed and scanned deployments."
+                  when:
+                    stageStatus: Success # Execute only if all prior steps succeeded
+                  spec:
+                    image: python:3.11-alpine
+                    shell: Python
+                    envVariables:
+                      SLACK_WEBHOOK: <+secrets.getValue("slack_webhook")>
+                      TEAMS_WEBHOOK: <+secrets.getValue("teams_webhook")>
+                    command: |-
+                      import os
+                      import urllib.request
+                      import json
+
+                      slack_webhook = os.environ.get("SLACK_WEBHOOK")
+                      teams_webhook = os.environ.get("TEAMS_WEBHOOK")
+
+                      build_id = "<+pipeline.sequenceId>"
+                      image_tag = "<+pipeline.variables.IMAGE_TAG>"
+                      registry = "<+pipeline.variables.DOCKER_REGISTRY>"
+                      image_name = "<+pipeline.variables.IMAGE_NAME>"
+                      branch = "<+codebase.branch>"
+                      console_url = "<+pipeline.url>"
+
+                      if slack_webhook:
+                          slack_payload = {
+                              "text": f"✅ *Healthcare CI Pipeline Succeeded* \n*Build ID:* {build_id} \n*Image:* {registry}/{image_name}:{image_tag} \n*Branch:* {branch} \n*Console Link:* {console_url}"
+                          }
+                          try:
+                              req = urllib.request.Request(
+                                  slack_webhook,
+                                  data=json.dumps(slack_payload).encode('utf-8'),
+                                  headers={'Content-Type': 'application/json'}
+                              )
+                              urllib.request.urlopen(req)
+                          except Exception as e:
+                              print(f"Failed to send Slack notification: {e}")
+
+                      if teams_webhook:
+                          teams_payload = {
+                              "@type": "MessageCard",
+                              "@context": "http://schema.org/extensions",
+                              "themeColor": "2ecc71",
+                              "summary": "Harness CI Build Success",
+                              "sections": [{
+                                  "activityTitle": "✅ Healthcare CI Build Success",
+                                  "facts": [
+                                      {"name": "Build Number", "value": build_id},
+                                      {"name": "Branch", "value": branch},
+                                      {"name": "Image Tag", "value": image_tag}
+                                  ]
+                              }]
+                          }
+                          try:
+                              req = urllib.request.Request(
+                                  teams_webhook,
+                                  data=json.dumps(teams_payload).encode('utf-8'),
+                                  headers={'Content-Type': 'application/json'}
+                              )
+                              urllib.request.urlopen(req)
+                          except Exception as e:
+                              print(f"Failed to send Teams notification: {e}")
